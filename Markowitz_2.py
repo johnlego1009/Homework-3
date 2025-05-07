@@ -50,12 +50,15 @@ class MyPortfolio:
     NOTE: You can modify the initialization function
     """
 
-    def __init__(self, price, exclude, lookback=50, gamma=0):
+    def __init__(self, price, exclude, lookback=50, momentum_lookback=100, top_n=5, rebalance_period=15):
         self.price = price
         self.returns = price.pct_change().fillna(0)
         self.exclude = exclude
         self.lookback = lookback
-        self.gamma = gamma
+        # self.gamma = gamma
+        self.momentum_lookback = momentum_lookback  # === 新增：動能回測期 ===
+        self.top_n = top_n  # === 新增：選擇前 N 名動能資產 ===
+        self.rebalance_period = rebalance_period  # === 新增：再平衡週期 ===
 
     def calculate_weights(self):
         # Get the assets by excluding the specified column
@@ -70,6 +73,24 @@ class MyPortfolio:
         TODO: Complete Task 4 Below
         """
 
+        for i in range(max(self.lookback, self.momentum_lookback), len(self.price), self.rebalance_period):
+            date = self.price.index[i]
+
+            # === Step 1: 動能排名 ===
+            momentum = (
+                self.price[assets].iloc[i - self.momentum_lookback:i].iloc[-1]
+                / self.price[assets].iloc[i - self.momentum_lookback:i].iloc[0]
+                - 1
+            )
+            # 取動能最強的 top_n 資產
+            top_assets = momentum.nlargest(self.top_n).index.tolist()
+
+            # === Step 2: ERC（風險貢獻平價）計算前 N 名資產的權重 ===
+            R_n = self.returns[top_assets].iloc[i - self.lookback:i]
+            weights = self.erc_weights(R_n)
+
+            self.portfolio_weights.loc[date, top_assets] = weights
+
         """
         TODO: Complete Task 4 Above
         """
@@ -77,19 +98,74 @@ class MyPortfolio:
         self.portfolio_weights.ffill(inplace=True)
         self.portfolio_weights.fillna(0, inplace=True)
 
+        # 進行權重歸一化，確保不會有槓桿
+        self.portfolio_weights = self.portfolio_weights.div(
+            self.portfolio_weights.sum(axis=1).clip(lower=1e-10), axis=0
+        )
+
+    def erc_weights(self, R_n):
+        # 計算風險貢獻平價（ERC）權重
+        cov = R_n.cov().values
+        n = len(cov)
+
+        # 計算每個資產對於投資組合總風險的貢獻
+        def risk_contribution(weights):
+            port_var = weights.T @ cov @ weights
+            mrc = cov @ weights
+            rc = weights * mrc
+            return rc / port_var
+
+        # 目標函數：最小化風險貢獻的偏差
+        def objective(weights):
+            rc = risk_contribution(weights)
+            return ((rc - rc.mean()) ** 2).sum()
+
+        # 初始猜測權重：均等分配
+        x0 = np.ones(n) / n
+        bounds = [(0, 1) for _ in range(n)]  # 權重限制在 0 到 1 之間
+        constraints = {"type": "eq", "fun": lambda x: np.sum(x) - 1}  # 權重總和為 1
+
+        # 使用 scipy 的 minimize 進行優化
+        from scipy.optimize import minimize
+        res = minimize(objective, x0, bounds=bounds, constraints=constraints)
+
+        if res.success:
+            # 若優化成功，將權重限制在 0 到 1 範圍內，並進行歸一化
+            weights = np.clip(res.x, 0, 1)
+            return (weights / weights.sum()).tolist()
+        else:
+            # 若優化失敗，均等分配權重
+            return [1 / n] * n
+
     def calculate_portfolio_returns(self):
-        # Ensure weights are calculated
+        # 確保權重已經計算
         if not hasattr(self, "portfolio_weights"):
             self.calculate_weights()
 
-        # Calculate the portfolio returns
+        # 計算投資組合回報
         self.portfolio_returns = self.returns.copy()
         assets = self.price.columns[self.price.columns != self.exclude]
-        self.portfolio_returns["Portfolio"] = (
+
+        # 原始投資組合回報
+        raw_returns = (
             self.portfolio_returns[assets]
             .mul(self.portfolio_weights[assets])
             .sum(axis=1)
         )
+
+        # 波動率平滑（過去 20 日）
+        volatility = raw_returns.rolling(window=20).std()
+
+        # 目標年化波動率（例如 0.15 = 15%）
+        target_vol = 0.15
+        scaling = target_vol / (volatility * np.sqrt(252))
+        scaling = scaling.clip(upper=2)  # 限制槓桿上限，防止過度放大
+
+        # 計算最終的投資組合回報
+        self.portfolio_returns["Portfolio"] = raw_returns * scaling
+
+        # 填補缺失的回報數據
+        self.portfolio_returns.fillna(0, inplace=True)
 
     def get_results(self):
         # Ensure portfolio returns are calculated
